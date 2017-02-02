@@ -33,6 +33,7 @@
 
 #include <target/target_core_base.h>
 #include <target/target_core_fabric.h>
+#include <target/target_core_backend.h>
 
 #include <asm/hvcall.h>
 #include <asm/vio.h>
@@ -2409,6 +2410,67 @@ static long ibmvscsis_parse_command(struct scsi_info *vscsi,
 	return rc;
 }
 
+static void ibmvscsis_modify_rep_luns(struct se_cmd *se_cmd)
+{
+	u16 data_len;
+	s32 len = se_cmd->data_length;
+	unsigned char *buf = NULL;
+
+	if (len <= 8)
+		return;
+
+	len -= 8;
+	buf = transport_kmap_data_sg(se_cmd);
+	if (buf) {
+		data_len = be32_to_cpu(*(u32 *)buf);
+		pr_debug("modify_rep_luns: len %d data_len %hud\n", len,
+			 data_len);
+		if (data_len < len)
+			len = data_len;
+		buf += 8;
+		while (len > 0) {
+			*buf |= SCSI_LUN_ADDR_METHOD_FLAT << 6;
+			len -= 8;
+			buf += 8;
+		}
+		transport_kunmap_data_sg(se_cmd);
+	}
+}
+
+static void ibmvscsis_modify_std_inquiry(struct se_cmd *se_cmd)
+{
+	struct se_device *dev = se_cmd->se_dev;
+	u32 cmd_len = se_cmd->data_length;
+	u32 repl_len;
+	unsigned char *buf = NULL;
+
+	if (cmd_len <= 8)
+		return;
+
+	buf = transport_kmap_data_sg(se_cmd);
+	if (buf) {
+		repl_len = 8;
+		if (cmd_len - 8 < repl_len)
+			repl_len = cmd_len - 8;
+		memcpy(&buf[8], "IBM     ", repl_len);
+
+		if (cmd_len > 16) {
+			repl_len = 16;
+			if (cmd_len - 16 < repl_len)
+				repl_len = cmd_len - 16;
+			if (memcmp(&buf[16], "VOPTA", 5))
+				memcpy(&buf[16], "3303      NVDISK", repl_len);
+		}
+		if (cmd_len > 32) {
+			repl_len = 4;
+			if (cmd_len - 32 < repl_len)
+				repl_len = cmd_len - 32;
+			memcpy(&buf[32], "0001", repl_len);
+		}
+		transport_kunmap_data_sg(se_cmd);
+	}
+}
+
 static int read_dma_window(struct scsi_info *vscsi)
 {
 	struct vio_dev *vdev = vscsi->dma_dev;
@@ -3617,10 +3679,18 @@ static int ibmvscsis_queue_data_in(struct se_cmd *se_cmd)
 	struct ibmvscsis_cmd *cmd = container_of(se_cmd, struct ibmvscsis_cmd,
 						 se_cmd);
 	struct iu_entry *iue = cmd->iue;
+	struct srp_cmd *srp = (struct srp_cmd *)iue->sbuf->buf;
 	struct scsi_info *vscsi = cmd->adapter;
 	char *sd;
 	uint len = 0;
 	int rc;
+
+	/* TBD: Why does flat addressing not work for the linux client? */
+	if (srp->cdb[0] == REPORT_LUNS && vscsi->client_data.os_type != LINUX)
+		ibmvscsis_modify_rep_luns(se_cmd);
+	/* This is a Standard Inquiry request */
+	else if ((srp->cdb[0] == INQUIRY) && ((srp->cdb[1] & 0x1) == 0))
+		ibmvscsis_modify_std_inquiry(se_cmd);
 
 	rc = srp_transfer_data(cmd, &vio_iu(iue)->srp.cmd, ibmvscsis_rdma, 1,
 			       1);
